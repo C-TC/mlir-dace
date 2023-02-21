@@ -240,14 +240,14 @@ public:
     }
 
     // TODO: Should be passed by a subflag
-    if (!op.getName().equals("main")) {
+    if (!op.getName().equals("main") || op.getName().equals("sparse")) {
       // NOTE: The nested SDFG is created at the call operation conversion
       rewriter.eraseOp(op);
       return success();
     }
 
     // HACK: Replaces the print_array call with returning arrays (PolybenchC)
-    if (op.getName().equals("main")) {
+    if (op.getName().equals("main") || op.getName().equals("sparse")) {
       for (int i = op.getNumArguments() - 1; i >= 0; --i)
         if (op.getArgument(i).getUses().empty())
           op.eraseArgument(i);
@@ -274,6 +274,16 @@ public:
 
         for (func::ReturnOp returnOp : op.getBody().getOps<func::ReturnOp>()) {
           returnOp->setOperands(arrays);
+        }
+      }
+    }
+
+    // special rewriting for sparse_tensor dialect lowering
+    if (op.getName().equals("sparse")) {
+      for (int i = op.getNumArguments() - 1; i >= 0; --i) {
+        // remove llvm.struct
+        if (op.getArgument(i).getType().isa<llvm::StructType>()) {
+          op.eraseArgument(i);
         }
       }
     }
@@ -1599,6 +1609,34 @@ public:
     if (markedToLink(*op))
       linkToNextState(rewriter, op->getLoc(), state);
 
+    return success();
+  }
+};
+
+// special rewriting for sparse_tensor dialect lowering
+class LLVMExtractvalueTOSDFG: public OpConversionPattern<mlir::LLVM::ExtractValueOp> {
+public:
+  using OpConversionPattern<mlir::LLVM::ExtractValueOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(mlir::LLVM::ExtractValueOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+    std::string sizeName = sdfg::utils::generateName("sparse_s");
+    
+    Operation *sdfg = getParentSDFG(op);
+    OpBuilder::InsertPoint ip = rewriter.saveInsertionPoint();
+    rewriter.setInsertionPointToStart(&sdfg->getRegion(0).getBlocks().front());
+    AllocSymbolOp::create(rewriter, op.getLoc(), sizeName);
+
+    rewriter.restoreInsertionPoint(ip);
+
+    StateNode state = StateNode::create(rewriter, op.getLoc(), "sparse_shape");
+    SymOp sizeSym = SymOp::create(rewriter, op.getLoc(), op.getResult().getType(), sizeName);
+
+    linkToLastState(rewriter, op.getLoc(), state);
+    if (markedToLink(*op)) {
+      linkToNextState(rewriter, op.getLoc(), state);
+    }
+
+    rewriter.eraseOp(op);
     return success();
   }
 };
