@@ -240,14 +240,14 @@ public:
     }
 
     // TODO: Should be passed by a subflag
-    if (!op.getName().equals("main") || op.getName().equals("sparse")) {
+    if (!op.getName().equals("main")) {
       // NOTE: The nested SDFG is created at the call operation conversion
       rewriter.eraseOp(op);
       return success();
     }
 
     // HACK: Replaces the print_array call with returning arrays (PolybenchC)
-    if (op.getName().equals("main") || op.getName().equals("sparse")) {
+    if (op.getName().equals("main")) {
       for (int i = op.getNumArguments() - 1; i >= 0; --i)
         if (op.getArgument(i).getUses().empty())
           op.eraseArgument(i);
@@ -274,16 +274,6 @@ public:
 
         for (func::ReturnOp returnOp : op.getBody().getOps<func::ReturnOp>()) {
           returnOp->setOperands(arrays);
-        }
-      }
-    }
-
-    // special rewriting for sparse_tensor dialect lowering
-    if (op.getName().equals("sparse")) {
-      for (int i = op.getNumArguments() - 1; i >= 0; --i) {
-        // remove llvm.struct
-        if (op.getArgument(i).getType().isa<llvm::StructType>()) {
-          op.eraseArgument(i);
         }
       }
     }
@@ -849,6 +839,65 @@ public:
 };
 
 // TODO: Implement memref.dim conversion
+class MemrefDimToSDFG: public OpConversionPattern<memref::DimOp> {
+public:
+  using OpConversionPattern<memref::DimOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(memref::DimOp op, OpAdaptor adaptor, ConversionPatternRewriter &rewriter) const override {
+    if (op.getConstantIndex().has_value() &&
+        sdfg::utils::isSizedType(op.getSource().getType().cast<ArrayType>())) {
+      // if memref.dim contains a constant index
+      sdfg::SizedType sized = sdfg::utils::getSizedType(op.getSource().getType().cast<ArrayType>());
+      llvm::ArrayRef<int64_t> integers = sized.getIntegers();
+      llvm::ArrayRef<bool> shape = sized.getShape();
+      llvm::ArrayRef<StringAttr> symbols = sized.getSymbols();
+
+      int targetIdx = op.getConstantIndex().value();
+      if (targetIdx >= 0 && targetIdx < shape.size()) {
+        int symIdx = 0;
+        int intIdx = 0;
+        for(int i = 0; i < targetIdx; ++i) {
+          if (shape[i]) {
+            intIdx++;
+          } else {
+            symIdx++;
+          }
+        }
+        if (shape[targetIdx]) {
+          // integer
+          // TODO: how to handle this
+          return failure();
+        } else {
+          // symbolic
+          std::string sizeName = symbols[symIdx].str();
+          // TODO: Do I need to alloc a symalloc here? was propogated from input
+
+          // std::string sizeName = sdfg::utils::generateName("sparse_s");
+          // Operation *sdfg = getParentSDFG(op);
+          // OpBuilder::InsertPoint ip = rewriter.saveInsertionPoint();
+          // rewriter.setInsertionPointToStart(&sdfg->getRegion(0).getBlocks().front());
+          // AllocSymbolOp::create(rewriter, op.getLoc(), sizeName);
+
+          // rewriter.restoreInsertionPoint(ip);
+
+          StateNode state = StateNode::create(rewriter, op.getLoc(), "sparse_shape");
+
+          rewriter.replaceOpWithNewOp<SymOp>(op, op.getResult().getType(), sizeName);
+
+          linkToLastState(rewriter, op.getLoc(), state);
+          if (markedToLink(*op)) {
+            linkToNextState(rewriter, op.getLoc(), state);
+          }
+        }
+      }
+    } else {
+      // TODO: could it take this branch?
+      return failure();
+    }
+
+    return success();
+  }
+};
 // TODO: Implement memref.rank conversion
 // TODO: Implement memref.realloc conversion
 // TODO: Implement memref.reshape conversion
@@ -1629,14 +1678,33 @@ public:
     rewriter.restoreInsertionPoint(ip);
 
     StateNode state = StateNode::create(rewriter, op.getLoc(), "sparse_shape");
-    SymOp sizeSym = SymOp::create(rewriter, op.getLoc(), op.getResult().getType(), sizeName);
+
+    rewriter.replaceOpWithNewOp<SymOp>(op, op.getResult().getType(), sizeName);
 
     linkToLastState(rewriter, op.getLoc(), state);
     if (markedToLink(*op)) {
       linkToNextState(rewriter, op.getLoc(), state);
     }
 
-    rewriter.eraseOp(op);
+    // special rewriting for sparse_tensor dialect lowering
+    if(SDFGNode sdfg_node = dyn_cast<SDFGNode>(sdfg)) {
+      for (int i = sdfg_node.getBody().getNumArguments() - 1; i >= 0; --i) {
+        // remove llvm.struct
+        if (sdfg_node.getBody().getArgument(i).getType().isa<mlir::LLVM::LLVMStructType>()) {
+          sdfg_node.getBody().eraseArgument(i);
+          sdfg_node.setNumArgs(sdfg_node.getNumArgs() - 1);
+        }
+      }
+    }
+    if(NestedSDFGNode sdfg_node = dyn_cast<NestedSDFGNode>(sdfg)) {
+      for (int i = sdfg_node.getBody().getNumArguments() - 1; i >= 0; --i) {
+        // remove llvm.struct
+        if (sdfg_node.getBody().getArguments()[i].getType().isa<mlir::LLVM::LLVMStructType>()) {
+          sdfg_node.getBody().eraseArgument(i);
+          sdfg_node.setNumArgs(sdfg_node.getNumArgs() - 1);
+        }
+      }
+    }
     return success();
   }
 };
@@ -1664,6 +1732,7 @@ void populateGenericToSDFGConversionPatterns(RewritePatternSet &patterns,
   patterns.add<MemrefAllocaToSDFG>(converter, ctxt);
   patterns.add<MemrefDeallocToSDFG>(converter, ctxt);
   patterns.add<MemrefCastToSDFG>(converter, ctxt);
+  patterns.add<MemrefDimToSDFG>(converter, ctxt);
 
   patterns.add<SCFForToSDFG>(converter, ctxt);
   patterns.add<SCFWhileToSDFG>(converter, ctxt);
@@ -1679,6 +1748,7 @@ void populateGenericToSDFGConversionPatterns(RewritePatternSet &patterns,
   patterns.add<LLVMGlobalToSDFG>(converter, ctxt);
   patterns.add<LLVMFuncToSDFG>(converter, ctxt);
   patterns.add<LLVMUndefToSDFG>(converter, ctxt);
+  patterns.add<LLVMExtractvalueTOSDFG>(converter, ctxt);
 }
 
 namespace {
